@@ -12,12 +12,13 @@ parses the YAML front matter and body content, and creates a .pptx with:
   - For each article: Slide 1 = title + image, Slide 2 = summary + speaker notes
 """
 
+from __future__ import annotations
+
 import argparse
 import io
-import os
 import re
 import sys
-import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
@@ -25,39 +26,119 @@ import yaml
 from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.text import PP_ALIGN
 from pptx.dml.color import RGBColor
 
 
-# ---------------------------------------------------------------------------
-# Markdown parsing helpers
-# ---------------------------------------------------------------------------
+# ── Constants ────────────────────────────────────────────────────────────────
+
+# Slide dimensions (widescreen 16:9)
+SLIDE_WIDTH = Inches(13.333)
+SLIDE_HEIGHT = Inches(7.5)
+
+# Color palette (GitHub dark theme)
+COLOR_BG_DARK = RGBColor(0x0D, 0x11, 0x17)
+COLOR_ACCENT = RGBColor(0x58, 0xA6, 0xFF)
+COLOR_TEXT_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+COLOR_TEXT_LIGHT = RGBColor(0xC9, 0xD1, 0xD9)
+COLOR_TEXT_MUTED = RGBColor(0x8B, 0x94, 0x9E)
+
+# Per-section theming (single source of truth)
+SECTION_META: dict[str, dict] = {
+    "new-release": {
+        "color": RGBColor(0x3F, 0xB9, 0x50),
+        "emoji": "🚀",
+        "title": "New Releases",
+        "dir": "new-releases",
+    },
+    "improvement": {
+        "color": RGBColor(0x58, 0xA6, 0xFF),
+        "emoji": "✨",
+        "title": "Improvements",
+        "dir": "improvements",
+    },
+    "deprecation": {
+        "color": RGBColor(0xF8, 0x54, 0x49),
+        "emoji": "⚠️",
+        "title": "Deprecations",
+        "dir": "deprecations",
+    },
+}
+
+SECTION_ORDER = ("new-release", "improvement", "deprecation")
+
+# Front-matter type aliases → canonical key
+_TYPE_ALIASES: dict[str, str] = {
+    "new-releases": "new-release",
+    "new-release": "new-release",
+    "release": "new-release",
+    "improvements": "improvement",
+    "improvement": "improvement",
+    "deprecations": "deprecation",
+    "deprecation": "deprecation",
+    "retired": "deprecation",
+}
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+FALLBACK_IMAGES: dict[str, Path] = {
+    key: SCRIPT_DIR / "imgs" / f"featured-v3-{meta['dir']}.png"
+    for key, meta in SECTION_META.items()
+}
+
+PX_TO_EMU = 914400 // 96  # EMUs per pixel at 96 DPI
+
+
+# ── Data model ───────────────────────────────────────────────────────────────
+
+@dataclass
+class Article:
+    title: str
+    date: str
+    type: str
+    image_url: str = ""
+    article_url: str = ""
+    summary: str = ""
+    speaker_notes: str = ""
+    file: str = ""
+
+    @property
+    def section_color(self) -> RGBColor:
+        return SECTION_META.get(self.type, {}).get("color", COLOR_ACCENT)
+
+    @property
+    def section_title(self) -> str:
+        return SECTION_META.get(self.type, {}).get("title", self.type)
+
+
+# ── Markdown parsing (pre-compiled regexes) ──────────────────────────────────
+
+_FRONT_MATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)", re.DOTALL)
+_SUMMARY_RE = re.compile(
+    r"##\s*Summary\s*\n+(.*?)(?=\n<!--|\n##|\Z)", re.DOTALL | re.IGNORECASE
+)
+_SPEAKER_NOTES_RE = re.compile(
+    r"<!--\s*\n?\s*speaker_notes:\s*\n(.*?)\s*-->", re.DOTALL
+)
+_IMAGE_RE = re.compile(r"!\[.*?\]\((.*?)\)")
+
 
 def parse_front_matter(text: str) -> tuple[dict, str]:
     """Split YAML front matter from markdown body."""
-    match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)", text, re.DOTALL)
-    if not match:
+    m = _FRONT_MATTER_RE.match(text)
+    if not m:
         return {}, text
-    fm = yaml.safe_load(match.group(1)) or {}
-    body = match.group(2)
-    return fm, body
+    return yaml.safe_load(m.group(1)) or {}, m.group(2)
 
 
 def extract_summary(body: str) -> str:
-    """Extract the summary section from the markdown body."""
-    # Look for ## Summary heading and grab everything until the next heading or comment
-    match = re.search(
-        r"##\s*Summary\s*\n+(.*?)(?=\n<!--|\n##|\Z)", body, re.DOTALL | re.IGNORECASE
-    )
-    if match:
-        return match.group(1).strip()
-    # Fallback: everything after the slide separator (---) that isn't the front matter
+    """Extract the Summary section from the markdown body."""
+    m = _SUMMARY_RE.search(body)
+    if m:
+        return m.group(1).strip()
+    # Fallback: text after the slide separator (---) that isn't front matter
     parts = re.split(r"\n---\s*\n", body, maxsplit=1)
     if len(parts) == 2:
-        text = parts[1]
-        # Remove HTML comments
-        text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-        # Remove headings
+        text = re.sub(r"<!--.*?-->", "", parts[1], flags=re.DOTALL)
         text = re.sub(r"^##.*$", "", text, flags=re.MULTILINE)
         return text.strip()
     return ""
@@ -65,12 +146,8 @@ def extract_summary(body: str) -> str:
 
 def extract_speaker_notes(body: str) -> str:
     """Extract speaker notes from an HTML comment block."""
-    match = re.search(
-        r"<!--\s*\n?\s*speaker_notes:\s*\n(.*?)\s*-->", body, re.DOTALL
-    )
-    if match:
-        return match.group(1).strip()
-    return ""
+    m = _SPEAKER_NOTES_RE.search(body)
+    return m.group(1).strip() if m else ""
 
 
 def extract_image_url(body: str, front_matter: dict) -> str:
@@ -78,497 +155,287 @@ def extract_image_url(body: str, front_matter: dict) -> str:
     url = front_matter.get("image_url", "")
     if url:
         return url
-    match = re.search(r"!\[.*?\]\((.*?)\)", body)
-    if match:
-        return match.group(1)
-    return ""
+    m = _IMAGE_RE.search(body)
+    return m.group(1) if m else ""
 
 
-# ---------------------------------------------------------------------------
-# Image downloading
-# ---------------------------------------------------------------------------
+def normalize_type(raw: str) -> str:
+    """Map any known type alias to its canonical key."""
+    return _TYPE_ALIASES.get(raw.lower(), raw.lower())
+
+
+# ── Image helpers ────────────────────────────────────────────────────────────
 
 def download_image(url: str, max_width: int = 1200) -> io.BytesIO | None:
-    """Download an image and return it as a BytesIO stream."""
+    """Download an image, resize if needed, return as BytesIO (or None)."""
     if not url:
         return None
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) copilot-updates-pptx/1.0"
         }
-        resp = requests.get(url, headers=headers, timeout=15, stream=True)
+        resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
-        img_data = io.BytesIO(resp.content)
-        # Validate it's actually an image
-        img = Image.open(img_data)
-        # Resize if too large (keeps aspect ratio)
+        img = Image.open(io.BytesIO(resp.content))
         if img.width > max_width:
             ratio = max_width / img.width
-            new_size = (max_width, int(img.height * ratio))
-            img = img.resize(new_size, Image.LANCZOS)
+            img = img.resize((max_width, int(img.height * ratio)), Image.LANCZOS)
         buf = io.BytesIO()
-        img_format = img.format or "PNG"
-        if img_format.upper() == "JPEG":
-            img.save(buf, format="JPEG", quality=85)
-        else:
-            img.save(buf, format="PNG")
+        fmt = "JPEG" if (img.format or "").upper() == "JPEG" else "PNG"
+        img.save(buf, format=fmt, **({"quality": 85} if fmt == "JPEG" else {}))
         buf.seek(0)
         return buf
-    except Exception as e:
-        print(f"  ⚠ Could not download image {url}: {e}")
+    except Exception as exc:
+        print(f"  ⚠ Could not download image {url}: {exc}")
         return None
 
 
-# ---------------------------------------------------------------------------
-# Presentation building
-# ---------------------------------------------------------------------------
+def _place_image(slide, image_stream: io.BytesIO, avail_top,
+                 avail_w=Inches(10), avail_h=Inches(4)):
+    """Scale an image to fit the available area and add it centered on the slide."""
+    img = Image.open(image_stream)
+    img_w, img_h = img.size
+    image_stream.seek(0)
 
-# Slide dimensions (widescreen 16:9)
-SLIDE_WIDTH = Inches(13.333)
-SLIDE_HEIGHT = Inches(7.5)
+    emu_w = img_w * PX_TO_EMU
+    emu_h = img_h * PX_TO_EMU
+    scale = min(avail_w / Emu(emu_w), avail_h / Emu(emu_h), 1.0)
 
-# Colors
-COLOR_BG_DARK = RGBColor(0x0D, 0x11, 0x17)       # GitHub dark bg
-COLOR_ACCENT = RGBColor(0x58, 0xA6, 0xFF)          # GitHub blue
-COLOR_TEXT_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
-COLOR_TEXT_LIGHT = RGBColor(0xC9, 0xD1, 0xD9)
-COLOR_TEXT_MUTED = RGBColor(0x8B, 0x94, 0x9E)
-COLOR_NEW_RELEASE = RGBColor(0x3F, 0xB9, 0x50)     # Green
-COLOR_IMPROVEMENT = RGBColor(0x58, 0xA6, 0xFF)     # Blue
-COLOR_DEPRECATION = RGBColor(0xF8, 0x54, 0x49)     # Red
+    pic_w = int(emu_w * scale)
+    pic_h = int(emu_h * scale)
+    left = int((SLIDE_WIDTH - pic_w) / 2)
 
-
-SECTION_COLORS = {
-    "new-release": COLOR_NEW_RELEASE,
-    "improvement": COLOR_IMPROVEMENT,
-    "deprecation": COLOR_DEPRECATION,
-}
-
-SECTION_EMOJI = {
-    "new-release": "🚀",
-    "improvement": "✨",
-    "deprecation": "⚠️",
-}
-
-SECTION_TITLES = {
-    "new-release": "New Releases",
-    "improvement": "Improvements",
-    "deprecation": "Deprecations",
-}
-
-# Fallback images (relative to the script directory)
-SCRIPT_DIR = Path(__file__).resolve().parent
-FALLBACK_IMAGES = {
-    "new-release": SCRIPT_DIR / "imgs" / "featured-v3-new-releases.png",
-    "improvement": SCRIPT_DIR / "imgs" / "featured-v3-improvements.png",
-    "deprecation": SCRIPT_DIR / "imgs" / "featured-v3-deprecations.png",
-}
+    slide.shapes.add_picture(image_stream, left, int(avail_top), pic_w, pic_h)
 
 
-def set_slide_bg(slide, color: RGBColor):
+def _resolve_image(image_stream: io.BytesIO | None, section_type: str) -> io.BytesIO | None:
+    """Return the provided stream, falling back to a local placeholder image."""
+    if image_stream:
+        return image_stream
+    fallback = FALLBACK_IMAGES.get(section_type)
+    if fallback and fallback.exists():
+        return io.BytesIO(fallback.read_bytes())
+    return None
+
+
+# ── Slide builders ───────────────────────────────────────────────────────────
+
+def _set_slide_bg(slide, color: RGBColor = COLOR_BG_DARK):
     """Set a solid background color on a slide."""
-    background = slide.background
-    fill = background.fill
+    fill = slide.background.fill
     fill.solid()
     fill.fore_color.rgb = color
 
 
-def add_textbox(slide, left, top, width, height, text, font_size=18,
-                color=COLOR_TEXT_WHITE, bold=False, alignment=PP_ALIGN.LEFT,
-                font_name="Segoe UI"):
-    """Helper to add a styled text box."""
-    txBox = slide.shapes.add_textbox(left, top, width, height)
-    tf = txBox.text_frame
-    tf.word_wrap = True
-    p = tf.paragraphs[0]
+def _add_text(slide, left, top, width, height, text, *,
+              size=18, color=COLOR_TEXT_WHITE, bold=False,
+              align=PP_ALIGN.LEFT, font="Segoe UI"):
+    """Add a single-paragraph styled text box and return the shape."""
+    box = slide.shapes.add_textbox(left, top, width, height)
+    box.text_frame.word_wrap = True
+    p = box.text_frame.paragraphs[0]
     p.text = text
-    p.font.size = Pt(font_size)
+    p.font.size = Pt(size)
     p.font.color.rgb = color
     p.font.bold = bold
-    p.font.name = font_name
-    p.alignment = alignment
-    return txBox
+    p.font.name = font
+    p.alignment = align
+    return box
+
+
+def _blank_slide(prs: Presentation):
+    """Add a blank slide with the dark background."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _set_slide_bg(slide)
+    return slide
 
 
 def create_title_slide(prs: Presentation, start_date: str, end_date: str):
     """Create the opening title slide."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])  # Blank layout
-    set_slide_bg(slide, COLOR_BG_DARK)
-
-    # Main title
-    add_textbox(
-        slide,
-        left=Inches(1), top=Inches(2),
-        width=Inches(11.333), height=Inches(1.5),
-        text="GitHub Copilot Updates",
-        font_size=44, color=COLOR_ACCENT, bold=True,
-        alignment=PP_ALIGN.CENTER,
-    )
-
-    # Subtitle with date range
-    add_textbox(
-        slide,
-        left=Inches(1), top=Inches(3.8),
-        width=Inches(11.333), height=Inches(1),
-        text=f"{start_date}  →  {end_date}",
-        font_size=24, color=COLOR_TEXT_LIGHT,
-        alignment=PP_ALIGN.CENTER,
-    )
-
-    # Footer
-    add_textbox(
-        slide,
-        left=Inches(1), top=Inches(5.5),
-        width=Inches(11.333), height=Inches(0.6),
-        text="Source: github.blog/changelog",
-        font_size=14, color=COLOR_TEXT_MUTED,
-        alignment=PP_ALIGN.CENTER,
-    )
+    slide = _blank_slide(prs)
+    cx, cw = Inches(1), Inches(11.333)
+    _add_text(slide, cx, Inches(2), cw, Inches(1.5),
+              "GitHub Copilot Updates",
+              size=44, color=COLOR_ACCENT, bold=True, align=PP_ALIGN.CENTER)
+    _add_text(slide, cx, Inches(3.8), cw, Inches(1),
+              f"{start_date}  →  {end_date}",
+              size=24, color=COLOR_TEXT_LIGHT, align=PP_ALIGN.CENTER)
+    _add_text(slide, cx, Inches(5.5), cw, Inches(0.6),
+              "Source: github.blog/changelog",
+              size=14, color=COLOR_TEXT_MUTED, align=PP_ALIGN.CENTER)
 
 
 def create_section_slide(prs: Presentation, section_type: str, count: int):
     """Create a section divider slide."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    set_slide_bg(slide, COLOR_BG_DARK)
-
-    emoji = SECTION_EMOJI.get(section_type, "")
-    title = SECTION_TITLES.get(section_type, section_type)
-    color = SECTION_COLORS.get(section_type, COLOR_ACCENT)
-
-    add_textbox(
-        slide,
-        left=Inches(1), top=Inches(2.5),
-        width=Inches(11.333), height=Inches(1.5),
-        text=f"{emoji}  {title}",
-        font_size=40, color=color, bold=True,
-        alignment=PP_ALIGN.CENTER,
-    )
-
-    add_textbox(
-        slide,
-        left=Inches(1), top=Inches(4.2),
-        width=Inches(11.333), height=Inches(0.8),
-        text=f"{count} update{'s' if count != 1 else ''}",
-        font_size=20, color=COLOR_TEXT_MUTED,
-        alignment=PP_ALIGN.CENTER,
-    )
+    slide = _blank_slide(prs)
+    meta = SECTION_META.get(section_type, {})
+    cx, cw = Inches(1), Inches(11.333)
+    _add_text(slide, cx, Inches(2.5), cw, Inches(1.5),
+              f"{meta.get('emoji', '')}  {meta.get('title', section_type)}",
+              size=40, color=meta.get("color", COLOR_ACCENT),
+              bold=True, align=PP_ALIGN.CENTER)
+    _add_text(slide, cx, Inches(4.2), cw, Inches(0.8),
+              f"{count} update{'s' if count != 1 else ''}",
+              size=20, color=COLOR_TEXT_MUTED, align=PP_ALIGN.CENTER)
 
 
-def create_article_title_slide(prs: Presentation, title: str, date: str,
-                                section_type: str, image_stream: io.BytesIO | None):
+def create_article_title_slide(prs: Presentation, article: Article,
+                               image_stream: io.BytesIO | None):
     """Create slide 1 for an article: title + hero image."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    set_slide_bg(slide, COLOR_BG_DARK)
+    slide = _blank_slide(prs)
+    color = article.section_color
 
-    color = SECTION_COLORS.get(section_type, COLOR_ACCENT)
+    _add_text(slide, Inches(0.8), Inches(0.4), Inches(3), Inches(0.4),
+              article.section_title.upper(), size=12, color=color, bold=True)
+    _add_text(slide, Inches(0.8), Inches(0.8), Inches(3), Inches(0.4),
+              article.date, size=12, color=COLOR_TEXT_MUTED)
+    _add_text(slide, Inches(0.8), Inches(1.4), Inches(11.5), Inches(1.6),
+              article.title, size=32, color=COLOR_TEXT_WHITE, bold=True)
 
-    # Type badge
-    add_textbox(
-        slide,
-        left=Inches(0.8), top=Inches(0.4),
-        width=Inches(3), height=Inches(0.4),
-        text=SECTION_TITLES.get(section_type, section_type).upper(),
-        font_size=12, color=color, bold=True,
-    )
-
-    # Date
-    add_textbox(
-        slide,
-        left=Inches(0.8), top=Inches(0.8),
-        width=Inches(3), height=Inches(0.4),
-        text=date,
-        font_size=12, color=COLOR_TEXT_MUTED,
-    )
-
-    # Title text
-    title_top = Inches(1.4)
-    title_height = Inches(1.6)
-    add_textbox(
-        slide,
-        left=Inches(0.8), top=title_top,
-        width=Inches(11.5), height=title_height,
-        text=title,
-        font_size=32, color=COLOR_TEXT_WHITE, bold=True,
-    )
-
-    # Hero image (centered below title)
-    if image_stream:
+    stream = _resolve_image(image_stream, article.type)
+    if stream:
         try:
-            img = Image.open(image_stream)
-            img_w, img_h = img.size
-            image_stream.seek(0)
-
-            # Available area for image
-            avail_w = Inches(10)
-            avail_h = Inches(4)
-            avail_top = Inches(3.2)
-
-            # Scale to fit
-            scale_w = avail_w / Emu(int(img_w * 914400 / 96))  # px to EMU at 96 DPI
-            scale_h = avail_h / Emu(int(img_h * 914400 / 96))
-            scale = min(scale_w, scale_h, 1.0)
-
-            pic_w = int(img_w * 914400 / 96 * scale)
-            pic_h = int(img_h * 914400 / 96 * scale)
-
-            # Center horizontally
-            left = int((SLIDE_WIDTH - pic_w) / 2)
-            top = int(avail_top)
-
-            slide.shapes.add_picture(image_stream, left, top, pic_w, pic_h)
-        except Exception as e:
-            print(f"  ⚠ Could not add image to slide: {e}")
+            _place_image(slide, stream, avail_top=Inches(3.2))
+        except Exception as exc:
+            print(f"  ⚠ Could not add image to slide: {exc}")
     else:
-        # No image — use fallback image based on section type
-        fallback_path = FALLBACK_IMAGES.get(section_type)
-        if fallback_path and fallback_path.exists():
-            try:
-                fb_stream = io.BytesIO(fallback_path.read_bytes())
-                img = Image.open(fb_stream)
-                img_w, img_h = img.size
-                fb_stream.seek(0)
-
-                avail_w = Inches(10)
-                avail_h = Inches(4)
-                avail_top = Inches(3.2)
-
-                scale_w = avail_w / Emu(int(img_w * 914400 / 96))
-                scale_h = avail_h / Emu(int(img_h * 914400 / 96))
-                scale = min(scale_w, scale_h, 1.0)
-
-                pic_w = int(img_w * 914400 / 96 * scale)
-                pic_h = int(img_h * 914400 / 96 * scale)
-
-                left = int((SLIDE_WIDTH - pic_w) / 2)
-                top = int(avail_top)
-
-                slide.shapes.add_picture(fb_stream, left, top, pic_w, pic_h)
-            except Exception as e:
-                print(f"  ⚠ Could not add fallback image: {e}")
-        else:
-            add_textbox(
-                slide,
-                left=Inches(1), top=Inches(4),
-                width=Inches(11.333), height=Inches(1),
-                text="(No image available)",
-                font_size=16, color=COLOR_TEXT_MUTED,
-                alignment=PP_ALIGN.CENTER,
-            )
+        _add_text(slide, Inches(1), Inches(4), Inches(11.333), Inches(1),
+                  "(No image available)",
+                  size=16, color=COLOR_TEXT_MUTED, align=PP_ALIGN.CENTER)
 
 
-def create_article_summary_slide(prs: Presentation, title: str, summary: str,
-                                  speaker_notes: str, article_url: str,
-                                  section_type: str):
+def create_article_summary_slide(prs: Presentation, article: Article):
     """Create slide 2 for an article: summary + speaker notes."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    set_slide_bg(slide, COLOR_BG_DARK)
+    slide = _blank_slide(prs)
 
-    color = SECTION_COLORS.get(section_type, COLOR_ACCENT)
+    _add_text(slide, Inches(0.8), Inches(0.4), Inches(11.5), Inches(0.8),
+              article.title, size=22, color=article.section_color, bold=True)
 
-    # Title (smaller, as reference)
-    add_textbox(
-        slide,
-        left=Inches(0.8), top=Inches(0.4),
-        width=Inches(11.5), height=Inches(0.8),
-        text=title,
-        font_size=22, color=color, bold=True,
-    )
-
-    # Summary text
-    txBox = slide.shapes.add_textbox(
-        Inches(0.8), Inches(1.5), Inches(11.5), Inches(4.5)
-    )
-    tf = txBox.text_frame
+    # Summary paragraphs
+    box = slide.shapes.add_textbox(Inches(0.8), Inches(1.5), Inches(11.5), Inches(4.5))
+    tf = box.text_frame
     tf.word_wrap = True
-
-    # Split summary into paragraphs for readability
-    paragraphs = [p.strip() for p in summary.split("\n") if p.strip()]
-    for i, para_text in enumerate(paragraphs):
-        if i == 0:
-            p = tf.paragraphs[0]
-        else:
-            p = tf.add_paragraph()
-        p.text = para_text
+    for i, line in enumerate(ln.strip() for ln in article.summary.split("\n") if ln.strip()):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.text = line
         p.font.size = Pt(18)
         p.font.color.rgb = COLOR_TEXT_LIGHT
         p.font.name = "Segoe UI"
         p.space_after = Pt(12)
 
-    # Article link at bottom
-    if article_url:
-        add_textbox(
-            slide,
-            left=Inches(0.8), top=Inches(6.5),
-            width=Inches(11.5), height=Inches(0.5),
-            text=f"🔗 {article_url}",
-            font_size=11, color=COLOR_TEXT_MUTED,
-        )
+    if article.article_url:
+        _add_text(slide, Inches(0.8), Inches(6.5), Inches(11.5), Inches(0.5),
+                  f"🔗 {article.article_url}", size=11, color=COLOR_TEXT_MUTED)
 
-    # Speaker notes
-    if speaker_notes:
-        notes_slide = slide.notes_slide
-        notes_slide.notes_text_frame.text = speaker_notes
+    if article.speaker_notes:
+        slide.notes_slide.notes_text_frame.text = article.speaker_notes
 
 
-# ---------------------------------------------------------------------------
-# File discovery and processing
-# ---------------------------------------------------------------------------
+# ── File discovery ───────────────────────────────────────────────────────────
 
-def discover_articles(output_dir: Path) -> dict[str, list[dict]]:
-    """Find all markdown files and group them by type."""
-    type_dirs = {
-        "new-release": "new-releases",
-        "improvement": "improvements",
-        "deprecation": "deprecations",
-    }
+def discover_articles(output_dir: Path) -> dict[str, list[Article]]:
+    """Scan output directories and return articles grouped by canonical type."""
+    articles: dict[str, list[Article]] = {t: [] for t in SECTION_ORDER}
 
-    articles_by_type: dict[str, list[dict]] = {
-        "new-release": [],
-        "improvement": [],
-        "deprecation": [],
-    }
-
-    for article_type, dir_name in type_dirs.items():
-        dir_path = output_dir / dir_name
+    for section_type in SECTION_ORDER:
+        dir_path = output_dir / SECTION_META[section_type]["dir"]
         if not dir_path.is_dir():
             continue
-
-        for md_file in sorted(dir_path.glob("*.md")):
-            text = md_file.read_text(encoding="utf-8")
+        for md in sorted(dir_path.glob("*.md")):
+            text = md.read_text(encoding="utf-8")
             fm, body = parse_front_matter(text)
+            resolved = normalize_type(fm.get("type", section_type))
+            articles.setdefault(resolved, []).append(Article(
+                title=fm.get("title", md.stem),
+                date=str(fm.get("date", "")),
+                type=resolved,
+                image_url=extract_image_url(body, fm),
+                article_url=fm.get("article_url", ""),
+                summary=extract_summary(body),
+                speaker_notes=extract_speaker_notes(body),
+                file=str(md),
+            ))
 
-            # Resolve the type from front matter or directory
-            fm_type = fm.get("type", article_type)
-            # Normalize type names
-            if fm_type in ("new-releases", "new-release", "release"):
-                fm_type = "new-release"
-            elif fm_type in ("improvements", "improvement"):
-                fm_type = "improvement"
-            elif fm_type in ("deprecations", "deprecation", "retired"):
-                fm_type = "deprecation"
-
-            articles_by_type.setdefault(fm_type, []).append({
-                "title": fm.get("title", md_file.stem),
-                "date": fm.get("date", ""),
-                "type": fm_type,
-                "image_url": extract_image_url(body, fm),
-                "article_url": fm.get("article_url", ""),
-                "summary": extract_summary(body),
-                "speaker_notes": extract_speaker_notes(body),
-                "file": str(md_file),
-            })
-
-    return articles_by_type
+    return articles
 
 
-def build_presentation(articles_by_type: dict[str, list[dict]],
+# ── Presentation orchestrator ────────────────────────────────────────────────
+
+def build_presentation(articles_by_type: dict[str, list[Article]],
                        start_date: str, end_date: str,
                        output_path: str):
     """Build the complete PowerPoint presentation."""
     prs = Presentation()
-
-    # Set widescreen 16:9
     prs.slide_width = SLIDE_WIDTH
     prs.slide_height = SLIDE_HEIGHT
 
-    # Title slide
     create_title_slide(prs, start_date, end_date)
 
     total = sum(len(v) for v in articles_by_type.values())
     processed = 0
 
-    # Process each type section
-    for section_type in ("new-release", "improvement", "deprecation"):
+    for section_type in SECTION_ORDER:
         articles = articles_by_type.get(section_type, [])
         if not articles:
             continue
 
-        # Section divider
         create_section_slide(prs, section_type, len(articles))
-
-        # Sort articles by date
-        articles.sort(key=lambda a: a.get("date", ""))
+        articles.sort(key=lambda a: a.date)
 
         for article in articles:
             processed += 1
-            title = article["title"]
-            print(f"  [{processed}/{total}] {title}")
-
-            # Download image
-            img_stream = download_image(article["image_url"])
-
-            # Slide 1: Title + Image
-            create_article_title_slide(
-                prs, title, article["date"], section_type, img_stream
-            )
-
-            # Slide 2: Summary + Speaker Notes
-            create_article_summary_slide(
-                prs, title, article["summary"],
-                article["speaker_notes"], article["article_url"],
-                section_type,
-            )
+            print(f"  [{processed}/{total}] {article.title}")
+            img = download_image(article.image_url)
+            create_article_title_slide(prs, article, img)
+            create_article_summary_slide(prs, article)
 
     prs.save(output_path)
     print(f"\n✅ Presentation saved to: {output_path}")
     print(f"   Total slides: {len(prs.slides)}")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ── Date-range detection ─────────────────────────────────────────────────────
 
 def detect_date_range(output_dir: Path) -> tuple[str, str]:
-    """Try to detect date range from the index.md or article files."""
-    index_file = output_dir / "index.md"
-    if index_file.exists():
-        text = index_file.read_text(encoding="utf-8")
-        match = re.search(r"(\d{4}-\d{2}-\d{2})\s*[-–—]\s*(\d{4}-\d{2}-\d{2})", text)
-        if match:
-            return match.group(1), match.group(2)
+    """Detect date range from index.md or article front matter."""
+    index = output_dir / "index.md"
+    if index.exists():
+        m = re.search(
+            r"(\d{4}-\d{2}-\d{2})\s*[-–—]\s*(\d{4}-\d{2}-\d{2})",
+            index.read_text(encoding="utf-8"),
+        )
+        if m:
+            return m.group(1), m.group(2)
 
-    # Fallback: scan all article dates
-    dates = []
-    for md_file in output_dir.rglob("*.md"):
-        if md_file.name == "index.md":
+    dates: list[str] = []
+    for md in output_dir.rglob("*.md"):
+        if md.name == "index.md":
             continue
-        text = md_file.read_text(encoding="utf-8")
-        fm, _ = parse_front_matter(text)
-        d = fm.get("date", "")
+        fm, _ = parse_front_matter(md.read_text(encoding="utf-8"))
+        d = str(fm.get("date", ""))
         if d:
-            dates.append(str(d))
+            dates.append(d)
 
     if dates:
         dates.sort()
         return dates[0], dates[-1]
-
     return "unknown", "unknown"
 
 
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert Copilot changelog markdown files to PowerPoint"
+        description="Convert Copilot changelog markdown files to PowerPoint",
     )
-    parser.add_argument(
-        "--output-dir", "-d",
-        default="output",
-        help="Directory containing the markdown files (default: output/)",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        default="",
-        help="Output .pptx filename (default: copilot-updates-{dates}.pptx)",
-    )
-    parser.add_argument(
-        "--from-date",
-        default="",
-        help="Start date for the title slide (auto-detected if not set)",
-    )
-    parser.add_argument(
-        "--to-date",
-        default="",
-        help="End date for the title slide (auto-detected if not set)",
-    )
+    parser.add_argument("-d", "--output-dir", default="output",
+                        help="Directory containing markdown files (default: output/)")
+    parser.add_argument("-o", "--output", default="",
+                        help="Output .pptx filename (auto-generated if omitted)")
+    parser.add_argument("--from-date", default="",
+                        help="Start date for title slide (auto-detected)")
+    parser.add_argument("--to-date", default="",
+                        help="End date for title slide (auto-detected)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -582,33 +449,27 @@ def main():
 
     total = sum(len(v) for v in articles_by_type.values())
     if total == 0:
-        print("❌ No articles found in the output directory.")
-        print("   Make sure the Copilot agent has generated .md files in:")
-        print(f"   {output_dir}/new-releases/")
-        print(f"   {output_dir}/improvements/")
-        print(f"   {output_dir}/deprecations/")
+        print("❌ No articles found. Ensure .md files exist in:")
+        for meta in SECTION_META.values():
+            print(f"   {output_dir}/{meta['dir']}/")
         sys.exit(1)
 
-    for section_type, articles in articles_by_type.items():
-        if articles:
-            label = SECTION_TITLES.get(section_type, section_type)
-            print(f"   {label}: {len(articles)} articles")
+    for stype, arts in articles_by_type.items():
+        if arts:
+            print(f"   {SECTION_META[stype]['title']}: {len(arts)} articles")
 
-    # Date range
-    start_date = args.from_date
-    end_date = args.to_date
-    if not start_date or not end_date:
-        detected_start, detected_end = detect_date_range(output_dir)
-        start_date = start_date or detected_start
-        end_date = end_date or detected_end
+    # Resolve date range
+    start = args.from_date
+    end = args.to_date
+    if not start or not end:
+        ds, de = detect_date_range(output_dir)
+        start = start or ds
+        end = end or de
 
-    # Output filename
-    output_path = args.output
-    if not output_path:
-        output_path = f"copilot-updates-{start_date}-to-{end_date}.pptx"
+    output_path = args.output or f"copilot-updates-{start}-to-{end}.pptx"
 
-    print(f"\n🔨 Building presentation ({start_date} → {end_date})...")
-    build_presentation(articles_by_type, start_date, end_date, output_path)
+    print(f"\n🔨 Building presentation ({start} → {end})...")
+    build_presentation(articles_by_type, start, end, output_path)
 
 
 if __name__ == "__main__":

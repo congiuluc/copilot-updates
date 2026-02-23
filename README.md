@@ -29,7 +29,7 @@ You'll be asked for:
 |---|---|---|
 | `startDate` | Start of date range (YYYY-MM-DD) | `2025-01-01` |
 | `endDate` | End of date range (YYYY-MM-DD) | `2025-12-31` |
-| `language` | Language for speaker notes | `italian` (default) |
+| `language` | Language for summaries and speaker notes | `english` (default) |
 
 The agent will:
 1. Fetch **all** article listings from `github.blog/changelog` filtered by `copilot` label (no type filter)
@@ -83,6 +83,8 @@ The script produces a widescreen (16:9) `.pptx` with dark GitHub-themed slides:
 - **Section dividers** for New Releases 🚀, Improvements ✨, Deprecations ⚠️
 - **Article title slide** with hero image
 - **Summary slide** with speaker notes in the Notes pane
+
+> When a non-English language is specified in Step 1, summaries and speaker notes are translated into that language. Article titles, product names, and technical terms always stay in English.
 
 ## Markdown file format
 
