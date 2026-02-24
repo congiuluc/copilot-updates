@@ -1,6 +1,6 @@
 ---
 mode: agent
-tools: ['web/fetch', 'edit']
+tools: ['web/fetch', 'edit', 'read', 'search']
 description: 'Fetch GitHub Copilot changelog articles and create structured markdown files for PowerPoint conversion'
 ---
 
@@ -17,10 +17,11 @@ Fetch GitHub Copilot changelog articles from the GitHub Blog and produce structu
 ## Rules (apply throughout all steps)
 
 - Process **ALL** articles in the date range — never stop early or skip items.
+- **Skip existing articles**: Before fetching or processing an article, check if the final output file already exists in `output/{new-releases,improvements,deprecations}/YYYY-MM-DD-slug.md`. If it does, skip that article entirely (do not re-fetch, re-process, or overwrite it). Only process **new** articles not already present.
 - Follow **all pagination links** on listing pages; do not stop at the first page.
 - **Language handling**: When `${input:language}` is `english` (default), write everything in English. When a different language is specified, translate **summaries** and **speaker notes** into that language. **Do NOT translate**: article titles (keep the original English title in YAML `title`, `# Heading`, and slide references), product/feature names (e.g. "Copilot", "GitHub Actions", "Gemini 3.1 Pro"), proper nouns, technical terms, or any text that originates from the source article and would lose meaning if translated.
 - YAML values must be **double-quoted**. Filenames must match the URL slug.
-- The Python script parses this exact structure — do not alter headings, separators, or comment format.
+- The Python script parses this exact structure — do not alter the front matter format, `---` separator, or `<!-- speaker_notes: -->` comment format. The `##` heading after the separator must match the article type (`## What's new`, `## What changed`, or `## What's deprecated`).
 
 ---
 
@@ -76,7 +77,7 @@ Plain text body here.
 
 For each raw file, generate:
 
-1. **Summary** (3–5 sentences): what changed, who it affects, key benefit.
+1. **Structured slide content** — NOT a descriptive paragraph. Use headings, bullet points, bold keywords, and tables to make the content scannable on a slide. The structure depends on the article type (see examples below).
 2. **Speaker notes** (5–8 sentences): conversational tone — practical impact, rollout dates, demo ideas.
 
 Both must be written in `${input:language}`. Keep article titles, product names, feature names, and technical terms in their original English form — translate only the explanatory prose around them.
@@ -89,6 +90,74 @@ Save final files organized by type:
 output/new-releases/YYYY-MM-DD-slug.md
 output/improvements/YYYY-MM-DD-slug.md
 output/deprecations/YYYY-MM-DD-slug.md
+```
+
+### Slide content structure by type
+
+Use these structures depending on the article type. Each `###` sub-heading becomes a colored section label on the slide. Bullet points use `- ` prefix. Use `**bold**` for key terms.
+
+#### New Release (`new-release`)
+
+```markdown
+## What's new
+
+One-liner with **key product/feature** and **status** (e.g. public preview, GA).
+
+### Why it matters
+
+- **Key benefit 1** — short explanation
+- **Key benefit 2** — short explanation
+
+### Where you can use it
+
+- **Platform 1** — details
+- **Platform 2** — details
+
+### Who gets it
+
+- Plans, rollout info, admin requirements
+```
+
+#### Improvement (`improvement`)
+
+```markdown
+## What changed
+
+One-liner explaining the change with **key terms** bolded.
+
+### Why it matters
+
+- **Benefit 1** — short explanation
+- **Benefit 2** — short explanation
+
+### How to get started (or Details)
+
+1. Step 1
+2. Step 2
+3. Step 3
+
+### Who gets it
+
+- Plans and availability
+```
+
+#### Deprecation (`deprecation`)
+
+```markdown
+## What's deprecated
+
+One-liner with **effective date** and scope.
+
+| Deprecated model | Replacement |
+|---|---|
+| Old thing 1 | **New thing 1** |
+| Old thing 2 | **New thing 2** |
+
+### Action required
+
+- **Who** needs to do what → specific action
+- **Admins** → specific action
+- What happens automatically (no action needed)
 ```
 
 ### Output file format
@@ -108,9 +177,9 @@ article_url: "https://github.blog/changelog/YYYY-MM-DD-slug"
 
 ---
 
-## Summary
+## What's new / What changed / What's deprecated
 
-Summary in ${input:language} here (3–5 sentences).
+Structured content here (see type-specific templates above).
 
 <!--
 speaker_notes:
@@ -120,12 +189,20 @@ Speaker notes in ${input:language} here (5–8 sentences).
 
 > Omit `![hero]()` line entirely when no image is available.
 
-## Step 4 — Create index file
+## Step 4 — Update index file
 
-After all articles are processed, create `output/index.md`:
+After all articles are processed, **update** (do not overwrite) `output/index.md`:
+
+1. If `output/index.md` already exists, **read it** and parse the existing entries.
+2. **Merge** newly processed articles into the existing list (avoid duplicates — match by filename).
+3. **Update the date range** in the title heading to span the full range of all articles present (min date → max date).
+4. **Sort** entries within each section by date (ascending).
+5. Write the updated file.
+
+If the file does not exist, create it from scratch:
 
 ```markdown
-# GitHub Copilot Updates: {startDate} - {endDate}
+# GitHub Copilot Updates: {minDate} - {maxDate}
 
 ## 🚀 New Releases
 - [Article Title](new-releases/YYYY-MM-DD-slug.md) - YYYY-MM-DD
@@ -134,5 +211,7 @@ After all articles are processed, create `output/index.md`:
 - [Article Title](improvements/YYYY-MM-DD-slug.md) - YYYY-MM-DD
 
 ## ⚠️ Deprecations
+- [Article Title](deprecations/YYYY-MM-DD-slug.md) - YYYY-MM-DD
+```
 - [Article Title](deprecations/YYYY-MM-DD-slug.md) - YYYY-MM-DD
 ```
