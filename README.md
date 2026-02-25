@@ -8,6 +8,12 @@
 
 ---
 
+## 🙏 Credits
+
+Special thanks to [@congiuluc](https://github.com/congiuluc) for conceiving and inspiring this solution.
+
+---
+
 ## ✨ Features
 
 - 🤖 **Copilot agent prompt** fetches and classifies changelog articles automatically
@@ -149,6 +155,7 @@ Speaker notes in the target language.
 
 This repository was created entirely with [GitHub Copilot](https://github.com/features/copilot).
 
-## 📄 License
+
+## �📄 License
 
 This project is licensed under the [MIT License](LICENSE).
