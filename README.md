@@ -31,18 +31,21 @@ Special thanks to [@congiuluc](https://github.com/congiuluc) for conceiving and 
 ## 🚀 Getting started
 
 ```bash
-# Create a virtual environment
-python -m venv .venv
-
-# Activate it
-# Windows (PowerShell)
-.venv\Scripts\Activate.ps1
-# macOS / Linux
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
+# Create a virtual environment and install dependencies in one step
+uv sync
 ```
+
+> **Don't have `uv`?** Install it with `pip install uv` or follow the [official docs](https://docs.astral.sh/uv/getting-started/installation/).
+
+> **Prefer plain `venv`/`pip`?**
+> ```bash
+> python -m venv .venv
+> # Windows (PowerShell)
+> .venv\Scripts\Activate.ps1
+> # macOS / Linux
+> source .venv/bin/activate
+> pip install .
+> ```
 
 ---
 
